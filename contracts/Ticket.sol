@@ -3,6 +3,8 @@ pragma solidity ^0.8.28;
 
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @notice Per-event parameters chosen by the organizer in `EventFactory.createEvent`.
 struct EventParams {
@@ -44,7 +46,6 @@ contract Ticket is ERC721, ReentrancyGuard {
     event GateSet(address indexed gate, bool allowed);
     event CheckedIn(uint256 indexed id, address indexed holder);
 
-    error NotImplemented();
     error NotOrganizer();
     error NotMarketplace();
     error NotGate();
@@ -56,6 +57,10 @@ contract Ticket is ERC721, ReentrancyGuard {
     error WrongPayment(uint256 sent, uint256 expected);
     error NoProceeds();
     error TransferFailed();
+    error CheckInClosed();
+    error SignatureExpired(uint256 validUntil);
+    error NotHolder(address signer);
+    error AlreadyCheckedIn(uint256 id);
 
     modifier onlyOrganizer() {
         if (msg.sender != organizer) revert NotOrganizer();
@@ -155,13 +160,32 @@ contract Ticket is ERC721, ReentrancyGuard {
         emit GateSet(gate, allowed);
     }
 
-    /// @notice Check a ticket in using the holder's signed QR payload.
+    /// @notice Check a ticket in using the holder's signed QR payload. The fan app signs a
+    ///         fresh `validUntil` every ~30s, so a gate cannot mark a ticket used without a
+    ///         current signature from its holder.
     /// @param id Token id.
     /// @param validUntil Expiry timestamp signed by the holder.
-    /// @param signature Holder's EIP-191 signature over (this, chainid, id, validUntil).
+    /// @param signature Holder's EIP-191 signature over `checkInHash(id, validUntil)`.
     function checkIn(uint256 id, uint256 validUntil, bytes calldata signature) external onlyGate {
-        // TODO: verify expiry, recover signer == ownerOf(id), !used[id]; mark used, emit CheckedIn
-        revert NotImplemented();
+        if (block.timestamp >= eventTime + CHECKIN_WINDOW) revert CheckInClosed();
+        if (block.timestamp > validUntil) revert SignatureExpired(validUntil);
+        if (used[id]) revert AlreadyCheckedIn(id);
+
+        // EIP-191: the same "\x19Ethereum Signed Message:\n32" prefix that wallets add in signMessage.
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(checkInHash(id, validUntil));
+        address signer = ECDSA.recover(digest, signature);
+        if (signer != ownerOf(id)) revert NotHolder(signer);
+
+        used[id] = true;
+        emit CheckedIn(id, signer);
+    }
+
+    /// @notice The hash a holder signs to check in. Binding this contract and the chain id
+    ///         stops a signature for one event (or network) being reused for another.
+    /// @param id Token id.
+    /// @param validUntil Expiry timestamp.
+    function checkInHash(uint256 id, uint256 validUntil) public view returns (bytes32) {
+        return keccak256(abi.encode(address(this), block.chainid, id, validUntil));
     }
 
     // ---------------------------------------------------------------- views

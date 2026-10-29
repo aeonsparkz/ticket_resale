@@ -1,5 +1,13 @@
 import { expect } from "chai";
-import { deployFixture, ethers, networkHelpers, FACE_VALUE, CHECKIN_WINDOW } from "./fixtures.js";
+import {
+  deployFixture,
+  ethers,
+  eventParams,
+  networkHelpers,
+  signCheckIn,
+  FACE_VALUE,
+  CHECKIN_WINDOW,
+} from "./fixtures.js";
 
 describe("Ticket", function () {
   let f: Awaited<ReturnType<typeof deployFixture>>;
@@ -145,6 +153,125 @@ describe("Ticket", function () {
 
       await networkHelpers.time.increaseTo(eventTime + CHECKIN_WINDOW);
       expect(await ticket.isValid(1n)).to.equal(false); // expired, never scanned
+    });
+  });
+
+  describe("check-in", function () {
+    let ticketAddr: string;
+    let validUntil: number;
+
+    // fan1 holds tickets #1 and #2; the QR is valid for 30 seconds.
+    beforeEach(async function () {
+      await f.ticket.connect(f.fan1).buy(2, { value: FACE_VALUE * 2n });
+      ticketAddr = await f.ticket.getAddress();
+      validUntil = (await networkHelpers.time.latest()) + 30;
+    });
+
+    it("checks in with a valid holder signature", async function () {
+      const { ticket, gate, fan1 } = f;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.emit(ticket, "CheckedIn")
+        .withArgs(1n, fan1.address);
+      expect(await ticket.used(1n)).to.equal(true);
+      expect(await ticket.isValid(1n)).to.equal(false);
+      expect(await ticket.isValid(2n)).to.equal(true); // other tickets unaffected
+    });
+
+    it("rejects a double check-in", async function () {
+      const { ticket, gate, fan1 } = f;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await ticket.connect(gate).checkIn(1n, validUntil, sig);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "AlreadyCheckedIn")
+        .withArgs(1n);
+    });
+
+    it("only an appointed gate can check in", async function () {
+      const { ticket, fan1, attacker } = f;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await expect(ticket.connect(attacker).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "NotGate");
+    });
+
+    it("a revoked gate cannot check in", async function () {
+      const { ticket, organizer, gate, fan1 } = f;
+      await expect(ticket.connect(organizer).setGate(gate.address, false))
+        .to.emit(ticket, "GateSet")
+        .withArgs(gate.address, false);
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "NotGate");
+    });
+
+    it("only the organizer can appoint gates", async function () {
+      const { ticket, attacker } = f;
+      await expect(ticket.connect(attacker).setGate(attacker.address, true))
+        .to.be.revertedWithCustomError(ticket, "NotOrganizer");
+    });
+
+    it("rejects an expired QR signature", async function () {
+      const { ticket, gate, fan1 } = f;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await networkHelpers.time.increaseTo(validUntil + 1);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "SignatureExpired")
+        .withArgs(validUntil);
+    });
+
+    it("rejects a signature from someone who does not hold the ticket", async function () {
+      const { ticket, gate, attacker } = f;
+      const sig = await signCheckIn(attacker, ticketAddr, 1n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "NotHolder")
+        .withArgs(attacker.address);
+    });
+
+    it("rejects a signature made for another token", async function () {
+      const { ticket, gate, fan1 } = f;
+      const sigFor2 = await signCheckIn(fan1, ticketAddr, 2n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sigFor2))
+        .to.be.revertedWithCustomError(ticket, "NotHolder");
+    });
+
+    it("rejects a signature made for another event's contract", async function () {
+      const { factory, ticket, organizer, gate, fan1, eventTime } = f;
+      await factory.connect(organizer).createEvent(eventParams(eventTime));
+      const [, otherAddr] = await factory.getEventsByOrganizer(organizer.address);
+      const sigForOther = await signCheckIn(fan1, otherAddr, 1n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sigForOther))
+        .to.be.revertedWithCustomError(ticket, "NotHolder");
+    });
+
+    it("the previous owner's QR stops working after a resale", async function () {
+      const { ticket, marketplace, gate, fan1, fan2 } = f;
+      const oldSig = await signCheckIn(fan1, ticketAddr, 1n, validUntil + 3600);
+      const price = await ticket.maxResalePrice();
+      await marketplace.connect(fan1).list(ticketAddr, 1n, price, ethers.ZeroAddress);
+      await marketplace.connect(fan2).buy(ticketAddr, 1n, { value: price });
+
+      await expect(ticket.connect(gate).checkIn(1n, validUntil + 3600, oldSig))
+        .to.be.revertedWithCustomError(ticket, "NotHolder")
+        .withArgs(fan1.address);
+      const newSig = await signCheckIn(fan2, ticketAddr, 1n, validUntil + 3600);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil + 3600, newSig)).to.emit(ticket, "CheckedIn");
+    });
+
+    it("allows check-in after eventTime but inside the window", async function () {
+      const { ticket, gate, fan1, eventTime } = f;
+      await networkHelpers.time.increaseTo(eventTime + CHECKIN_WINDOW - 60);
+      const qrExpiry = (await networkHelpers.time.latest()) + 30;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, qrExpiry);
+      await expect(ticket.connect(gate).checkIn(1n, qrExpiry, sig)).to.emit(ticket, "CheckedIn");
+    });
+
+    it("rejects check-in after the window", async function () {
+      const { ticket, gate, fan1, eventTime } = f;
+      await networkHelpers.time.increaseTo(eventTime + CHECKIN_WINDOW);
+      const qrExpiry = (await networkHelpers.time.latest()) + 30;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, qrExpiry);
+      await expect(ticket.connect(gate).checkIn(1n, qrExpiry, sig))
+        .to.be.revertedWithCustomError(ticket, "CheckInClosed");
     });
   });
 });

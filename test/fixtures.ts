@@ -1,4 +1,5 @@
 import { network } from "hardhat";
+import type { Signer } from "ethers";
 
 // One network connection shared by every test file, so loadFixture snapshots work across files.
 export const { ethers, networkHelpers } = await network.create();
@@ -26,7 +27,21 @@ export function eventParams(eventTime: number, overrides: Record<string, unknown
   };
 }
 
-/// Deploys the factory (which deploys the marketplace) and creates one event a week from now.
+/// What the fan app does for the rotating QR: sign (ticket contract, chain id, token id, validUntil).
+/// signMessage adds the EIP-191 prefix, matching MessageHashUtils.toEthSignedMessageHash on-chain.
+export async function signCheckIn(holder: Signer, ticketAddr: string, id: bigint, validUntil: number) {
+  const { chainId } = await ethers.provider.getNetwork();
+  const hash = ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "uint256", "uint256", "uint256"],
+      [ticketAddr, chainId, id, validUntil],
+    ),
+  );
+  return holder.signMessage(ethers.getBytes(hash));
+}
+
+/// Deploys the factory (which deploys the marketplace), creates one event a week from now,
+/// and appoints `gate` as a check-in scanner.
 export async function deployFixture() {
   const [deployer, organizer, gate, fan1, fan2, attacker] = await ethers.getSigners();
 
@@ -37,6 +52,7 @@ export async function deployFixture() {
   await factory.connect(organizer).createEvent(eventParams(eventTime));
   const [ticketAddr] = await factory.getEventsByOrganizer(organizer.address);
   const ticket = await ethers.getContractAt("Ticket", ticketAddr);
+  await ticket.connect(organizer).setGate(gate.address, true);
 
   return { factory, marketplace, ticket, eventTime, deployer, organizer, gate, fan1, fan2, attacker };
 }

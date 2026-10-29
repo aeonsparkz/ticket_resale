@@ -1,5 +1,13 @@
 import { expect } from "chai";
-import { deployFixture, ethers, eventParams, networkHelpers, FACE_VALUE, ROYALTY_BPS } from "./fixtures.js";
+import {
+  deployFixture,
+  ethers,
+  eventParams,
+  networkHelpers,
+  signCheckIn,
+  FACE_VALUE,
+  ROYALTY_BPS,
+} from "./fixtures.js";
 
 const CAP = (FACE_VALUE * 11_000n) / 10_000n; // 0.11 ETH
 const royaltyOf = (price: bigint) => (price * BigInt(ROYALTY_BPS)) / 10_000n;
@@ -7,6 +15,12 @@ const royaltyOf = (price: bigint) => (price * BigInt(ROYALTY_BPS)) / 10_000n;
 describe("Marketplace", function () {
   let f: Awaited<ReturnType<typeof deployFixture>>;
   let ticketAddr: string;
+
+  async function checkInTicket1() {
+    const validUntil = (await networkHelpers.time.latest()) + 30;
+    const sig = await signCheckIn(f.fan1, ticketAddr, 1n, validUntil);
+    await f.ticket.connect(f.gate).checkIn(1n, validUntil, sig);
+  }
 
   // Every test starts with fan1 holding ticket #1.
   beforeEach(async function () {
@@ -60,6 +74,13 @@ describe("Marketplace", function () {
       await expect(marketplace.connect(attacker).list(await fake.getAddress(), 1n, CAP, ethers.ZeroAddress))
         .to.be.revertedWithCustomError(marketplace, "UnregisteredTicket")
         .withArgs(await fake.getAddress());
+    });
+
+    it("rejects a used (checked-in) ticket", async function () {
+      const { marketplace, fan1 } = f;
+      await checkInTicket1();
+      await expect(marketplace.connect(fan1).list(ticketAddr, 1n, CAP, ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(marketplace, "TicketUsed");
     });
 
     it("rejects listing at or after eventTime", async function () {
@@ -174,6 +195,13 @@ describe("Marketplace", function () {
       const { marketplace, fan1 } = f;
       await expect(marketplace.connect(fan1).buy(ticketAddr, 1n, { value: CAP }))
         .to.be.revertedWithCustomError(marketplace, "CannotBuyOwnListing");
+    });
+
+    it("rejects a ticket that was checked in after it was listed", async function () {
+      const { marketplace, fan2 } = f;
+      await checkInTicket1();
+      await expect(marketplace.connect(fan2).buy(ticketAddr, 1n, { value: CAP }))
+        .to.be.revertedWithCustomError(marketplace, "TicketUsed");
     });
 
     it("rejects a listing made before eventTime once eventTime has passed", async function () {
