@@ -1,57 +1,45 @@
-# Sample Hardhat 3 Project (`mocha` and `ethers`)
+# Scam-Proof Ticket Resale
 
-This project showcases a Hardhat 3 project using `mocha` for tests and the `ethers` library for Ethereum interactions.
+NUS IS4302 group project. Every concert ticket is an ERC-721 token. Any resale, wherever buyer and seller met (Carousell, Telegram, …), settles through our Marketplace in **one atomic transaction**: the ticket goes to the buyer, payment to the seller and a royalty to the organizer, or nothing happens at all. The organizer sets a resale price cap that the contracts enforce. At the venue, a gate checks a rotating QR signed by the ticket's current owner.
 
-To learn more about Hardhat 3, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3](https://hardhat.org/hardhat3-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+## Contracts
 
-## Project Overview
+| Contract | Role |
+| --- | --- |
+| `EventFactory.sol` | Organizers create events here. Deploys one `Ticket` contract per event and keeps the `isTicket` registry of genuine events. Deploys the single `Marketplace`. Enforces platform limits: cap 100–200% of face value, royalty ≤ 10%. |
+| `Ticket.sol` | ERC-721 for one event. Primary sale with a per-wallet limit. Tickets can only move through the Marketplace. Trading closes at the event time, and unscanned tickets expire 12h later. Gate check-in verifies the holder's signature. Primary-sale money is escrowed until the event; if the organizer cancels, holders claim face value refunds. |
+| `Marketplace.sol` | Public or private (one named buyer) listings at or below the cap. `buy` swaps ticket, payment and royalty atomically. It only trades tickets from factory-registered events. |
 
-This example project includes:
+Built on [OpenZeppelin Contracts v5](https://github.com/OpenZeppelin/openzeppelin-contracts) (MIT): `ERC721`, `ReentrancyGuard`, `ECDSA`, `MessageHashUtils`.
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using `mocha` and ethers.js
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
-
-## Usage
-
-### Running Tests
-
-To run all the tests in the project, execute the following command:
+## Run the tests
 
 ```shell
+npm install
 npx hardhat test
 ```
 
-You can also selectively run the Solidity or `mocha` tests:
+There are 72 mocha tests in `test/`, covering the factory, primary sale, transfer lock, listing, purchase and royalty split, private listings, reentrancy and atomicity attacks, signed check-in, time rules, cancellation refunds and end-to-end flows.
+
+## Run the demo front end
 
 ```shell
-npx hardhat test solidity
-npx hardhat test mocha
+npx hardhat node                                            # terminal 1
+npx hardhat run scripts/demo-setup.ts --network localhost   # terminal 2
+cd frontend && npm install && npm run dev                   # open http://localhost:5173
 ```
 
-### Make a deployment to Sepolia
+See [`frontend/README.md`](frontend/README.md) for the accounts and a step-by-step demo.
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
-
-To run the deployment to a local chain:
+## Deploy
 
 ```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
-```
-
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
+npx hardhat ignition deploy ignition/modules/TicketResale.ts                    # in-memory chain
+npx hardhat keystore set SEPOLIA_RPC_URL
 npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+npx hardhat ignition deploy ignition/modules/TicketResale.ts --network sepolia
 ```
 
-After setting the variable, you can run the deployment with the Sepolia network:
+## Stack
 
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
-```
+Hardhat 3, Solidity 0.8.34, TypeScript, mocha + chai, ethers v6. The front end uses React + Vite.
