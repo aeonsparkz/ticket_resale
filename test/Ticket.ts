@@ -75,9 +75,18 @@ describe("Ticket", function () {
   });
 
   describe("proceeds", function () {
-    it("organizer withdraws primary sale proceeds", async function () {
-      const { ticket, organizer, fan1 } = f;
+    it("proceeds are locked until eventTime", async function () {
+      const { ticket, organizer, fan1, eventTime } = f;
+      await ticket.connect(fan1).buy(1, { value: FACE_VALUE });
+      await expect(ticket.connect(organizer).withdrawProceeds())
+        .to.be.revertedWithCustomError(ticket, "ProceedsLocked")
+        .withArgs(eventTime);
+    });
+
+    it("organizer withdraws primary sale proceeds after eventTime", async function () {
+      const { ticket, organizer, fan1, eventTime } = f;
       await ticket.connect(fan1).buy(2, { value: FACE_VALUE * 2n });
+      await networkHelpers.time.increaseTo(eventTime);
 
       const tx = ticket.connect(organizer).withdrawProceeds();
       await expect(tx).to.emit(ticket, "ProceedsWithdrawn").withArgs(organizer.address, FACE_VALUE * 2n);
@@ -92,6 +101,7 @@ describe("Ticket", function () {
     });
 
     it("reverts when there is nothing to withdraw", async function () {
+      await networkHelpers.time.increaseTo(f.eventTime);
       await expect(f.ticket.connect(f.organizer).withdrawProceeds())
         .to.be.revertedWithCustomError(f.ticket, "NoProceeds");
     });
@@ -272,6 +282,119 @@ describe("Ticket", function () {
       const sig = await signCheckIn(fan1, ticketAddr, 1n, qrExpiry);
       await expect(ticket.connect(gate).checkIn(1n, qrExpiry, sig))
         .to.be.revertedWithCustomError(ticket, "CheckInClosed");
+    });
+  });
+
+  describe("cancellation and refunds", function () {
+    // fan1 holds #1 and #2, fan2 holds #3.
+    beforeEach(async function () {
+      await f.ticket.connect(f.fan1).buy(2, { value: FACE_VALUE * 2n });
+      await f.ticket.connect(f.fan2).buy(1, { value: FACE_VALUE });
+    });
+
+    it("organizer cancels; trading, check-in and validity all stop", async function () {
+      const { ticket, marketplace, organizer, gate, fan1, fan2 } = f;
+      const ticketAddr = await ticket.getAddress();
+      await expect(ticket.connect(organizer).cancelEvent()).to.emit(ticket, "EventCancelled");
+
+      expect(await ticket.cancelled()).to.equal(true);
+      expect(await ticket.tradingOpen()).to.equal(false);
+      expect(await ticket.isValid(1n)).to.equal(false);
+      await expect(ticket.connect(fan2).buy(1, { value: FACE_VALUE }))
+        .to.be.revertedWithCustomError(ticket, "TradingClosed");
+      await expect(marketplace.connect(fan1).list(ticketAddr, 1n, FACE_VALUE, ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(marketplace, "TradingClosed");
+
+      const validUntil = (await networkHelpers.time.latest()) + 30;
+      const sig = await signCheckIn(fan1, ticketAddr, 1n, validUntil);
+      await expect(ticket.connect(gate).checkIn(1n, validUntil, sig))
+        .to.be.revertedWithCustomError(ticket, "EventIsCancelled");
+    });
+
+    it("a listing made before cancellation can no longer be bought", async function () {
+      const { ticket, marketplace, organizer, fan1, fan2 } = f;
+      const ticketAddr = await ticket.getAddress();
+      await marketplace.connect(fan1).list(ticketAddr, 1n, FACE_VALUE, ethers.ZeroAddress);
+      await ticket.connect(organizer).cancelEvent();
+      await expect(marketplace.connect(fan2).buy(ticketAddr, 1n, { value: FACE_VALUE }))
+        .to.be.revertedWithCustomError(marketplace, "TradingClosed");
+    });
+
+    it("only the organizer can cancel, only once, and only before eventTime", async function () {
+      const { ticket, organizer, attacker, eventTime } = f;
+      await expect(ticket.connect(attacker).cancelEvent()).to.be.revertedWithCustomError(ticket, "NotOrganizer");
+
+      const snapshot = await networkHelpers.takeSnapshot();
+      await ticket.connect(organizer).cancelEvent();
+      await expect(ticket.connect(organizer).cancelEvent()).to.be.revertedWithCustomError(ticket, "EventIsCancelled");
+      await snapshot.restore();
+
+      await networkHelpers.time.increaseTo(eventTime);
+      await expect(ticket.connect(organizer).cancelEvent())
+        .to.be.revertedWithCustomError(ticket, "EventAlreadyStarted");
+    });
+
+    it("holder claims face value and the ticket is burned", async function () {
+      const { ticket, organizer, fan1 } = f;
+      await ticket.connect(organizer).cancelEvent();
+
+      const tx = ticket.connect(fan1).claimRefund(1n);
+      await expect(tx).to.emit(ticket, "Refunded").withArgs(1n, fan1.address, FACE_VALUE);
+      await expect(tx).to.changeEtherBalances(ethers, [fan1, ticket], [FACE_VALUE, -FACE_VALUE]);
+      await expect(ticket.ownerOf(1n)).to.be.revertedWithCustomError(ticket, "ERC721NonexistentToken");
+      expect(await ticket.proceeds()).to.equal(FACE_VALUE * 2n);
+    });
+
+    it("a ticket cannot be refunded twice", async function () {
+      const { ticket, organizer, fan1 } = f;
+      await ticket.connect(organizer).cancelEvent();
+      await ticket.connect(fan1).claimRefund(1n);
+      await expect(ticket.connect(fan1).claimRefund(1n))
+        .to.be.revertedWithCustomError(ticket, "ERC721NonexistentToken");
+    });
+
+    it("only the current holder can claim", async function () {
+      const { ticket, organizer, attacker } = f;
+      await ticket.connect(organizer).cancelEvent();
+      await expect(ticket.connect(attacker).claimRefund(1n))
+        .to.be.revertedWithCustomError(ticket, "NotTicketOwner");
+    });
+
+    it("refunds are not available unless the event is cancelled", async function () {
+      const { ticket, fan1 } = f;
+      await expect(ticket.connect(fan1).claimRefund(1n))
+        .to.be.revertedWithCustomError(ticket, "EventNotCancelled");
+    });
+
+    it("a resale buyer is refunded face value, not the price they paid", async function () {
+      const { ticket, marketplace, organizer, fan1, attacker } = f;
+      const ticketAddr = await ticket.getAddress();
+      const cap = await ticket.maxResalePrice();
+      await marketplace.connect(fan1).list(ticketAddr, 1n, cap, ethers.ZeroAddress);
+      await marketplace.connect(attacker).buy(ticketAddr, 1n, { value: cap });
+      await ticket.connect(organizer).cancelEvent();
+
+      await expect(ticket.connect(attacker).claimRefund(1n)).to.changeEtherBalance(ethers, attacker, FACE_VALUE);
+    });
+
+    it("the escrow covers every ticket exactly, and the organizer cannot take it", async function () {
+      const { ticket, organizer, fan1, fan2, eventTime } = f;
+      await ticket.connect(organizer).cancelEvent();
+      await ticket.connect(fan1).claimRefund(1n);
+      await ticket.connect(fan1).claimRefund(2n);
+      await ticket.connect(fan2).claimRefund(3n);
+      expect(await ticket.proceeds()).to.equal(0n);
+
+      await networkHelpers.time.increaseTo(eventTime);
+      await expect(ticket.connect(organizer).withdrawProceeds())
+        .to.be.revertedWithCustomError(ticket, "EventIsCancelled");
+    });
+
+    it("burning is the only exception to the transfer lock", async function () {
+      const { ticket, organizer, fan1, fan2 } = f;
+      await ticket.connect(organizer).cancelEvent();
+      await expect(ticket.connect(fan1).transferFrom(fan1.address, fan2.address, 1n))
+        .to.be.revertedWithCustomError(ticket, "TransfersDisabled");
     });
   });
 });

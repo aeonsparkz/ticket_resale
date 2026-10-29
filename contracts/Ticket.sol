@@ -36,7 +36,8 @@ contract Ticket is ERC721, ReentrancyGuard {
     uint256 public constant CHECKIN_WINDOW = 12 hours;
 
     uint256 public totalMinted;
-    uint256 public proceeds;
+    uint256 public proceeds; // primary sale money, escrowed until eventTime (or paid out as refunds)
+    bool public cancelled;
     mapping(address => uint256) public primaryPurchases;
     mapping(uint256 => bool) public used;
     mapping(address => bool) public isGate;
@@ -45,6 +46,8 @@ contract Ticket is ERC721, ReentrancyGuard {
     event ProceedsWithdrawn(address indexed organizer, uint256 amount);
     event GateSet(address indexed gate, bool allowed);
     event CheckedIn(uint256 indexed id, address indexed holder);
+    event EventCancelled();
+    event Refunded(uint256 indexed id, address indexed holder, uint256 amount);
 
     error NotOrganizer();
     error NotMarketplace();
@@ -61,6 +64,11 @@ contract Ticket is ERC721, ReentrancyGuard {
     error SignatureExpired(uint256 validUntil);
     error NotHolder(address signer);
     error AlreadyCheckedIn(uint256 id);
+    error ProceedsLocked(uint64 unlockTime);
+    error EventIsCancelled();
+    error EventNotCancelled();
+    error EventAlreadyStarted();
+    error NotTicketOwner();
 
     modifier onlyOrganizer() {
         if (msg.sender != organizer) revert NotOrganizer();
@@ -119,14 +127,46 @@ contract Ticket is ERC721, ReentrancyGuard {
         emit TicketPurchased(msg.sender, firstId, quantity);
     }
 
-    /// @notice Organizer withdraws primary sale proceeds.
+    /// @notice Organizer withdraws primary sale proceeds. They stay escrowed until the event
+    ///         starts, so fans can be refunded if the organizer cancels before then.
     function withdrawProceeds() external onlyOrganizer nonReentrant {
+        if (cancelled) revert EventIsCancelled();
+        if (block.timestamp < eventTime) revert ProceedsLocked(eventTime);
         uint256 amount = proceeds;
         if (amount == 0) revert NoProceeds();
         proceeds = 0;
         (bool ok, ) = organizer.call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit ProceedsWithdrawn(organizer, amount);
+    }
+
+    // ---------------------------------------------------------------- cancellation and refunds
+
+    /// @notice Organizer cancels the event. Stops all trading and check-in, and lets every
+    ///         ticket holder claim back the face value from the escrowed proceeds.
+    function cancelEvent() external onlyOrganizer {
+        if (cancelled) revert EventIsCancelled();
+        // After eventTime the event has happened and proceeds can be withdrawn,
+        // so cancelling then could leave the escrow empty.
+        if (block.timestamp >= eventTime) revert EventAlreadyStarted();
+        cancelled = true;
+        emit EventCancelled();
+    }
+
+    /// @notice After a cancellation, the current holder burns their ticket for a face value refund.
+    ///         Resale buyers also get face value, not what they paid (known limitation).
+    /// @param id Token id.
+    function claimRefund(uint256 id) external nonReentrant {
+        if (!cancelled) revert EventNotCancelled();
+        if (ownerOf(id) != msg.sender) revert NotTicketOwner();
+
+        // Effects before sending ETH (CEI). Burning stops the same ticket being refunded twice.
+        proceeds -= faceValue;
+        _burn(id);
+
+        (bool ok, ) = msg.sender.call{value: faceValue}("");
+        if (!ok) revert TransferFailed();
+        emit Refunded(id, msg.sender, faceValue);
     }
 
     // ---------------------------------------------------------------- transfers
@@ -144,9 +184,10 @@ contract Ticket is ERC721, ReentrancyGuard {
     /// @dev Transfer lock: after mint, only the marketplace may move tokens.
     function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         // In OZ v5 the previous owner is not a parameter, so read it first.
-        // from == address(0) is a mint, which is always allowed.
+        // from == address(0) is a mint and to == address(0) is a burn (only claimRefund burns);
+        // both are always allowed.
         address from = _ownerOf(tokenId);
-        if (from != address(0) && msg.sender != marketplace) revert TransfersDisabled();
+        if (from != address(0) && to != address(0) && msg.sender != marketplace) revert TransfersDisabled();
         return super._update(to, tokenId, auth);
     }
 
@@ -167,6 +208,7 @@ contract Ticket is ERC721, ReentrancyGuard {
     /// @param validUntil Expiry timestamp signed by the holder.
     /// @param signature Holder's EIP-191 signature over `checkInHash(id, validUntil)`.
     function checkIn(uint256 id, uint256 validUntil, bytes calldata signature) external onlyGate {
+        if (cancelled) revert EventIsCancelled();
         if (block.timestamp >= eventTime + CHECKIN_WINDOW) revert CheckInClosed();
         if (block.timestamp > validUntil) revert SignatureExpired(validUntil);
         if (used[id]) revert AlreadyCheckedIn(id);
@@ -195,15 +237,20 @@ contract Ticket is ERC721, ReentrancyGuard {
         return (faceValue * resaleCapBps) / 10_000;
     }
 
-    /// @notice True while primary sale and resale are allowed (before the event starts).
+    /// @notice True while primary sale and resale are allowed (before the event starts,
+    ///         and only if it has not been cancelled).
     function tradingOpen() public view returns (bool) {
-        return block.timestamp < eventTime;
+        return !cancelled && block.timestamp < eventTime;
     }
 
-    /// @notice True if the ticket exists, is unused, and the check-in window has not passed.
-    ///         Lets any buyer verify a ticket before paying.
+    /// @notice True if the ticket exists, is unused, the event is not cancelled, and the
+    ///         check-in window has not passed. Lets any buyer verify a ticket before paying.
     /// @param id Token id.
     function isValid(uint256 id) external view returns (bool) {
-        return _ownerOf(id) != address(0) && !used[id] && block.timestamp < eventTime + CHECKIN_WINDOW;
+        return
+            _ownerOf(id) != address(0) &&
+            !used[id] &&
+            !cancelled &&
+            block.timestamp < eventTime + CHECKIN_WINDOW;
     }
 }
